@@ -1296,7 +1296,6 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "INSERT OR IGNORE INTO media_vault (file_hash, bot_name, created_at) VALUES (?, ?, ?)",
             (f_hash, bot_label(context.bot), time.time()))
         is_dup = (cursor.rowcount == 0)
-        migrating = False
         old_row = None
         if MIGRATE["on"]:
             old_row = await old_fetch(f_hash)
@@ -1321,10 +1320,11 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         pass
                 if state["settings"]["autodelete"]:
                     await delete_msg(msg)
-            return
+                return
+            # db_enabled is OFF: duplicate was still counted above, but blocking is
+            # disabled — fall through so the media is relayed normally.
         elif old_row:
             # MIGRATION: carry old created_at + bot_name, then drain old row
-            migrating = True
             await _db_conn.execute(
                 "UPDATE media_vault SET bot_name = ?, created_at = ? WHERE file_hash = ?",
                 (old_row[0] or bot_label(context.bot), old_row[1] or time.time(), f_hash))
@@ -1335,7 +1335,6 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _db_conn.commit()
     except Exception as e:
         log.error(f"DB error during duplicate check: {e}")
-        migrating = False
 
     # --- ALL MESSAGES PICKER: hold media, ask which topic via buttons ---
     if chooser_mode:
