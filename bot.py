@@ -34,7 +34,7 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger(__name__)
 
 # --- GLOBAL STATE ---
-CODE_VERSION = "v9 (2026-09-16)"
+CODE_VERSION = "v10 (2026-09-16)"
 LOCK_FILE = "vault_bot.lock"
 
 def acquire_lock():
@@ -1321,8 +1321,8 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if state["settings"]["autodelete"]:
                     await delete_msg(msg)
                 return
-            # db_enabled is OFF: duplicate was still counted above, but blocking is
-            # disabled — fall through so the media is relayed normally.
+            # /db OFF: duplicate was counted above, but blocking is disabled —
+            # fall through so the media is relayed normally.
         elif old_row:
             # MIGRATION: carry old created_at + bot_name, then drain old row
             await _db_conn.execute(
