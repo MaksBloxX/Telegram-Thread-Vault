@@ -1,0 +1,26 @@
+# --- REAL CONFIG WITH TOKENS — NEVER COMMIT ---
+config.py
+
+# --- DATABASES + WAL/SHM FILES ---
+*.db
+*.db-shm
+*.db-wal
+
+# --- LOGS ---
+*.log
+vault_bot.log
+valut_bot.log
+
+# --- RUNTIME LOCK ---
+vault_bot.lock
+
+# --- PYTHON ---
+__pycache__/
+*.pyc
+*.pyo
+
+# --- EDITOR / OS JUNK ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
