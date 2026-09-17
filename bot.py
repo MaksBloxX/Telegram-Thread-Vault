@@ -4,12 +4,11 @@ import time
 import hashlib
 import logging
 import os
-import random
 import signal
 import sys
 import aiosqlite
 from telegram import Update, InputMediaPhoto, InputMediaVideo, InputMediaDocument, \
-    InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity
+    InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, \
     filters, ContextTypes
 from telegram.error import RetryAfter, TelegramError, BadRequest, Forbidden
@@ -35,7 +34,7 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger(__name__)
 
 # --- GLOBAL STATE ---
-CODE_VERSION = "s10 (2026-09-17) — Unified GP queue + hard topic-reset repair + per-sender chooser"
+CODE_VERSION = "v10 (2026-09-16)"
 LOCK_FILE = "vault_bot.lock"
 
 def acquire_lock():
@@ -67,8 +66,8 @@ _db_conn: aiosqlite.Connection = None   # NEW db (media_new.db)
 _old_conn: aiosqlite.Connection = None  # OLD db (media.db) — drain-only, never written
 MIGRATE = {"on": True}
 TOKEN_LABELS = {}
-TOPIC_CACHE = {}     # (bot_id, chat_id, name) -> thread_id
-REV_CACHE = {}       # (bot_id, chat_id, thread_id) -> name
+TOPIC_CACHE = {}     # (bot_id, name) -> thread_id
+REV_CACHE = {}       # (bot_id, thread_id) -> name
 BIND_CACHE = {}      # (bot_id, chat_id) -> topic name
 CACHE_LOADED = False
 _topic_lock = None
@@ -104,8 +103,6 @@ class QueueState:
         self.dest_chat = None        # relay destination (ADMIN dm or source)
         self.thread = None           # destination topic thread id (or None=General)
         self.topic_name = None       # for #tag captions
-        self.mirror = []             # [(partner_chat, partner_thread)] mirror copies
-        self.sender_id = None        # admin who sent it (alias lookup)
         self.processing_msg_ids = []
 
 def get_state(bot_id):
@@ -118,16 +115,16 @@ def get_state(bot_id):
             "album_lock": asyncio.Lock(),
             "db_enabled": config.DEFAULT_SETTINGS.get("db_check", True),
             "last_warn": 0.0,
-            "manual_topic": {},          # per-user sticky topic (TEXT/General + unbound source chats only)
-            "dm_retry_at": {},           # per-chat cooldown after topic-creation failure
-            "choosers": {},              # sender_id -> All Messages topic picker pending media
+            "manual_topic": None,       # /use <topic>
+            "dm_retry_at": 0.0,         # cooldown after DM/topic creation failure
+            "chooser": None,            # All Messages topic picker pending media
         }
     return bot_states[bot_id]
 
-# --- SECURITY FILTER: only the authorized users (you + partner) ---
+# --- SECURITY FILTER: only ADMIN_ID ---
 class AdminFilter(filters.MessageFilter):
     def filter(self, message):
-        return message.from_user and message.from_user.id in config.ADMIN_IDS
+        return message.from_user and message.from_user.id == config.ADMIN_ID
 
 admin_filter = AdminFilter()
 
@@ -157,40 +154,11 @@ async def init_db():
     await _db_conn.execute("""
         CREATE TABLE IF NOT EXISTS topics (
             bot_id INTEGER NOT NULL,
-            chat_id INTEGER NOT NULL,
             name TEXT NOT NULL,
             thread_id INTEGER NOT NULL,
             icon_color INTEGER,
             created_at REAL,
-            PRIMARY KEY (bot_id, chat_id, name)
-        )
-    """)
-    # One-time migration: Solo-era topics table has no chat_id column
-    cols = [r[1] for r in await _db_conn.execute_fetchall("PRAGMA table_info(topics)")]
-    if "chat_id" not in cols:
-        log.info("Migrating topics table to mirror schema (adding chat_id)...")
-        await _db_conn.execute("ALTER TABLE topics RENAME TO topics_legacy")
-        await _db_conn.execute("""
-            CREATE TABLE topics (
-                bot_id INTEGER NOT NULL,
-                chat_id INTEGER NOT NULL,
-                name TEXT NOT NULL,
-                thread_id INTEGER NOT NULL,
-                icon_color INTEGER,
-                created_at REAL,
-                PRIMARY KEY (bot_id, chat_id, name)
-            )
-        """)
-        await _db_conn.execute(
-            "INSERT OR IGNORE INTO topics (bot_id, chat_id, name, thread_id, icon_color, created_at) "
-            "SELECT bot_id, ?, name, thread_id, icon_color, created_at FROM topics_legacy",
-            (config.ADMIN_IDS[0],))
-        await _db_conn.execute("DROP TABLE topics_legacy")
-    await _db_conn.execute("""
-        CREATE TABLE IF NOT EXISTS aliases (
-            user_id INTEGER PRIMARY KEY,
-            alias TEXT NOT NULL,
-            created_at REAL
+            PRIMARY KEY (bot_id, name)
         )
     """)
     await _db_conn.execute("""
@@ -278,34 +246,19 @@ def compose_str(head, tag):
         return f"{head}\n{DIVIDER}\n{tag}"
     return head or tag
 
-def cap_parts(base, base_ents, custom, tag, lead=None):
-    """Returns (caption, entities, parse_mode). lead = mirror identity block (prepended)."""
+def cap_parts(base, base_ents, custom, tag):
+    """Returns (caption, entities, parse_mode)."""
     if custom:
-        s = compose_str(custom, tag)
-        if lead:
-            s = f"{lead}\n\n{s}" if s else lead
-        return s, None, "HTML"
+        return compose_str(custom, tag), None, "HTML"
     head = base or ""
-    s = compose_str(head, tag)
-    ents = base_ents if head else None
-    if lead:
-        if s:
-            if ents:
-                shift = len(lead) + 2
-                ents = [MessageEntity(type=e.type, offset=e.offset + shift, length=e.length)
-                        for e in ents]
-            s = f"{lead}\n\n{s}"
-        else:
-            s = lead
-            ents = None
-    return s, ents, None
+    return compose_str(head, tag), (base_ents if head else None), None
 
-def captioned_obj(msg, custom, tag, lead=None):
-    cap, ent, pm = cap_parts(msg.caption, msg.caption_entities, custom, tag, lead)
+def captioned_obj(msg, custom, tag):
+    cap, ent, pm = cap_parts(msg.caption, msg.caption_entities, custom, tag)
     return get_media_obj(msg, cap, ent, pm)
 
-def captioned_input(mobj, custom, tag, lead=None):
-    cap, ent, pm = cap_parts(mobj.caption, mobj.caption_entities, custom, tag, lead)
+def captioned_input(mobj, custom, tag):
+    cap, ent, pm = cap_parts(mobj.caption, mobj.caption_entities, custom, tag)
     kw = {"media": mobj.media, "caption": cap}
     if pm:
         kw["parse_mode"] = pm
@@ -322,13 +275,13 @@ def album_first_caption(items):
         return items[0].caption, items[0].caption_entities
     return None, None
 
-def first_obj(msg, custom, tag, base_cap, base_ents, lead=None):
-    """First item of a returned album: one caption (+ mirror identity block on top)."""
-    cap, ent, pm = cap_parts(base_cap, base_ents, custom, tag, lead)
+def first_obj(msg, custom, tag, base_cap, base_ents):
+    """First item of a returned album: one caption = title + divider + tag."""
+    cap, ent, pm = cap_parts(base_cap, base_ents, custom, tag)
     return get_media_obj(msg, cap, ent, pm)
 
-def first_input(mobj, custom, tag, base_cap, base_ents, lead=None):
-    cap, ent, pm = cap_parts(base_cap, base_ents, custom, tag, lead)
+def first_input(mobj, custom, tag, base_cap, base_ents):
+    cap, ent, pm = cap_parts(base_cap, base_ents, custom, tag)
     kw = {"media": mobj.media, "caption": cap}
     if pm:
         kw["parse_mode"] = pm
@@ -351,9 +304,9 @@ async def ensure_cache():
     global CACHE_LOADED
     if CACHE_LOADED:
         return
-    for b, c, n, t in await db_fetchall("SELECT bot_id, chat_id, name, thread_id FROM topics"):
-        TOPIC_CACHE[(b, c, n)] = t
-        REV_CACHE[(b, c, t)] = n
+    for b, n, t in await db_fetchall("SELECT bot_id, name, thread_id FROM topics"):
+        TOPIC_CACHE[(b, n)] = t
+        REV_CACHE[(b, t)] = n
     for b, c, n in await db_fetchall("SELECT bot_id, chat_id, topic_name FROM bindings"):
         BIND_CACHE[(b, c)] = n
     CACHE_LOADED = True
@@ -361,53 +314,37 @@ async def ensure_cache():
 def binding_for(bot_id, chat_id):
     return BIND_CACHE.get((bot_id, chat_id))
 
-def invalidate_thread(bot_id, chat_id, name):
-    """Forget a possibly-stale topic thread (partner reset the bot); next use recreates it."""
-    th = TOPIC_CACHE.pop((bot_id, chat_id, name), None)
-    if th is not None:
-        REV_CACHE.pop((bot_id, chat_id, th), None)
-        log.info(f"Invalidated stale topic thread: dm={chat_id} name={name!r} thread={th}")
-    return th
-
-def vault_chats():
-    """All authorized users' DMs (a DM chat_id equals the user id)."""
-    return list(config.ADMIN_IDS)
-
-def partner_chats(sender_chat):
-    """DM chats of the OTHER authorized users."""
-    return [c for c in config.ADMIN_IDS if c != sender_chat]
-
-async def topic_thread(bot, state, name, chat_id):
-    """thread_id for topic `name` inside DM `chat_id`; creates it there if needed."""
-    if not name or chat_id is None:
+async def topic_thread(bot, state, name):
+    """thread_id for a topic name; creates the topic in the admin DM if needed."""
+    if not name:
         return None
     await ensure_cache()
-    key = (bot.id, chat_id, name)
+    key = (bot.id, name)
     if key in TOPIC_CACHE:
         return TOPIC_CACHE[key]
     now = time.time()
-    if now < state["dm_retry_at"].get(chat_id, 0.0):
-        return None  # this DM not ready yet — fall back to General
+    if now < state["dm_retry_at"]:
+        return None  # DM not ready yet — fall back to General
     async with get_lock():
         if key in TOPIC_CACHE:
             return TOPIC_CACHE[key]
         try:
             color = ICON_COLORS[len(TOPIC_CACHE) % len(ICON_COLORS)]
             ft = await bot.create_forum_topic(
-                chat_id=chat_id, name=name, icon_color=color)
+                chat_id=config.ADMIN_ID, name=name, icon_color=color)
             thread = ft.message_thread_id
             await _db_conn.execute(
-                "INSERT OR REPLACE INTO topics (bot_id, chat_id, name, thread_id, icon_color, created_at) "
-                "VALUES (?,?,?,?,?,?)", (bot.id, chat_id, name, thread, color, time.time()))
+                "INSERT OR REPLACE INTO topics (bot_id, name, thread_id, icon_color, created_at) "
+                "VALUES (?,?,?,?,?)", (bot.id, name, thread, color, time.time()))
             await _db_conn.commit()
             TOPIC_CACHE[key] = thread
-            REV_CACHE[(bot.id, chat_id, thread)] = name
-            log.info(f"Topic created: {name} -> thread {thread} (dm {chat_id})")
+            REV_CACHE[(bot.id, thread)] = name
+            log.info(f"Topic created: {name} -> thread {thread}")
             return thread
         except (Forbidden, BadRequest, RetryAfter) as e:
-            log.warning(f"Cannot create topic '{name}' in DM {chat_id} ({e}) — that user must "
-                        f"/start the bot, enable Threaded Mode in BotFather + Topics toggle in the DM.")
-            state["dm_retry_at"][chat_id] = time.time() + 300
+            log.warning(f"Cannot create topic '{name}' ({e}) — enable Threaded Mode in "
+                        f"BotFather + the Topics toggle inside the bot DM.")
+            state["dm_retry_at"] = time.time() + 300
             return None
 
 async def dm_warn_once(bot, state, chat_id):
@@ -422,302 +359,94 @@ async def dm_warn_once(bot, state, chat_id):
     except TelegramError:
         pass
 
-async def mirror_warn_once(bot, state, chat_id):
-    if state.get("mirror_warned"):
-        return
-    state["mirror_warned"] = True
-    try:
-        m = await bot.send_message(
-            chat_id, "⚠️ Couldn't mirror to your partner — they must /start this bot "
-                     "and enable the Topics toggle in their DM with it.")
-        asyncio.create_task(delete_msg(m, 12))
-    except TelegramError:
-        pass
-
-# ================= AUTO-SYNC TOPICS (runs on /start) =================
-async def auto_sync_topics(bot, user_id):
-    """Repair pass when a user /starts (new, or back after delete/block/reinstall).
-
-    WHY send+delete instead of a typing indicator: chat_action is too lenient —
-    Telegram accepts it even for a message_thread_id that no longer really exists,
-    so a "typing..." probe can silently report a dead thread as healthy. That false
-    "healthy" reading is exactly what caused topic B ↔ F cross-talk after a partner
-    reset the bot: the OLD thread stayed cached as valid, and a NEW topic created
-    afterwards with a fresh Telegram thread id collided with that stale mapping.
-
-    send_message + delete is a REAL mutating call — Telegram must resolve the
-    thread to accept it, so a dead thread reliably raises BadRequest.
-
-    If ANY topic proves stale, we don't patch it alone — we wipe and rebuild
-    ALL of this user's topic records for this bot. Partial repairs are how the
-    cross-mapping bug happened in the first place.
-    """
-    state = get_state(bot.id)
-    await ensure_cache()
-    all_topics = {n for (b, c, n) in TOPIC_CACHE if b == bot.id}
-    for row in await db_fetchall("SELECT DISTINCT name FROM topics WHERE bot_id=?", (bot.id,)):
-        all_topics.add(row[0])
-    if not all_topics:
-        return
-
-    log.info(f"Auto-sync: probing {len(all_topics)} topic(s) for user {user_id}...")
-    stale = False
-    for name in sorted(all_topics):
-        cached = TOPIC_CACHE.get((bot.id, user_id, name))
-        if cached is None:
-            continue
-        try:
-            probe = await bot.send_message(user_id, "🔧", message_thread_id=cached)
-            try:
-                await probe.delete()
-            except TelegramError:
-                pass
-        except BadRequest as e:
-            log.warning(f"Auto-sync: stale thread {cached} for '{name}' (user {user_id}) — {e}")
-            stale = True
-        except TelegramError as e:
-            log.debug(f"Auto-sync: probe network hiccup for '{name}' (user {user_id}): {e}")
-
-    if stale:
-        log.warning(f"Auto-sync: DM reset detected for user {user_id} — rebuilding ALL topics")
-        for name in list(all_topics):
-            invalidate_thread(bot.id, user_id, name)
-        await _db_conn.execute(
-            "DELETE FROM topics WHERE bot_id=? AND chat_id=?", (bot.id, user_id))
-        await _db_conn.commit()
-
-    created, failed = 0, []
-    for name in sorted(all_topics):
-        if (bot.id, user_id, name) in TOPIC_CACHE:
-            continue
-        thread = await topic_thread(bot, state, name, user_id)
-        if thread:
-            created += 1
-        else:
-            failed.append(name)
-
-    if not created and not failed:
-        log.info(f"Auto-sync: user {user_id} already has all {len(all_topics)} topics OK")
-        return
-
-    parts = [f"🔄 Topic sync: {created} topic(s) (re)created."]
-    if failed:
-        parts.append("⚠️ Couldn't create: " + ", ".join(failed) +
-                     " — enable the Topics toggle in this DM.")
-    try:
-        m = await bot.send_message(user_id, "\n".join(parts))
-        asyncio.create_task(delete_msg(m, 15))
-    except TelegramError as e:
-        log.error(f"Auto-sync report to {user_id} failed: {e}")
-    log.info(f"Auto-sync done for {user_id}: created={created} failed={len(failed)}")
-
-# ================= ANONYMOUS MIRROR ALIASES =================
-# Identity format: "<emoji>: <name> <trinket>"  e.g. "🦊: Outsider 🍀"
-ALIAS_EMOJIS = [
-    "🦊", "🐼", "🦉", "🐺", "🦁", "🐯", "🦅", "🐸", "🐰", "🦝",
-    "🐨", "🦄", "🐙", "🦋", "🐢", "🦜", "🐬", "🦔", "🐿", "🦩",
-]
-ALIAS_NAMES = [
-    "Anonymous", "Outsider", "Stranger", "Wanderer", "Ghost", "Phantom",
-    "Shadow", "Nomad", "Mystery", "Cipher", "Echo", "Mirage", "Riddle",
-    "Secret", "Unknown", "Masked", "Hidden", "Silent", "Veiled", "Enigma",
-]
-ALIAS_TRINKETS = ["🍀", "✨", "🌙", "⭐", "🌸", "🔥", "🪐", "🍁", "🌊", "⚡"]
-
-def is_new_alias(alias):
-    return bool(alias) and ": " in alias
-
-def mirror_lead(alias):
-    """Identity block above the caption: identity + divider."""
-    return f"{alias}\n{DIVIDER}"
-
-async def alias_for(user_id, bot=None):
-    """Persistent anonymous identity per user — mirror copies never reveal real names."""
-    row = await db_fetchone("SELECT alias FROM aliases WHERE user_id=?", (user_id,))
-    if row and is_new_alias(row[0]):
-        return row[0]
-    # Assign a new identity (also upgrades old-format rows)
-    rows = await db_fetchall("SELECT alias FROM aliases")
-    used = {r[0] for r in rows if is_new_alias(r[0])}
-    used_emojis = {a.split(":", 1)[0] for a in used}
-    used_names = {a.split(": ", 1)[1].rsplit(" ", 1)[0] for a in used}
-    free_emojis = [e for e in ALIAS_EMOJIS if e not in used_emojis] or ALIAS_EMOJIS
-    free_names = [n for n in ALIAS_NAMES if n not in used_names] or ALIAS_NAMES
-    alias = (f"{random.choice(free_emojis)}: {random.choice(free_names)} "
-             f"{random.choice(ALIAS_TRINKETS)}")
-    async with get_lock():
-        await _db_conn.execute(
-            "INSERT OR REPLACE INTO aliases (user_id, alias, created_at) VALUES (?,?,?)",
-            (user_id, alias, time.time()))
-        await _db_conn.commit()
-    log.info(f"Alias assigned: user {user_id} -> {alias}")
-    if bot is not None:
-        try:
-            await bot.send_message(
-                user_id, f"Your share alias: *{alias}*\n"
-                         "Mirrored copies show this to your partner instead of your name.",
-                parse_mode="Markdown")
-        except TelegramError:
-            pass
-    return alias
-
-# ================= MIRROR-AWARE GROUP SENDERS =================
-async def send_msgs_grouped(bot, chat_id, thread, msgs, custom, line, lead=None):
-    """Style-B album send from Message objects. lead = mirror identity block. Returns ok.
-    Self-heals stale threads ONCE and continues remaining chunks on the fresh thread."""
-    state = get_state(bot.id)
-    base_cap, base_ents = album_first_caption(msgs)
-    final = []
-    for i, m in enumerate(msgs):
-        obj = first_obj(m, custom, line, base_cap, base_ents, lead) if i == 0 \
-            else get_media_obj(m, None)
-        if obj:
-            final.append(obj)
-    v = [m for m in final if not isinstance(m, InputMediaDocument)]
-    d = [m for m in final if isinstance(m, InputMediaDocument)]
-    ok, sent = True, False
-    for chunk in [v[i:i + 10] for i in range(0, len(v), 10)] + \
-                 [d[i:i + 10] for i in range(0, len(d), 10)]:
-        if not chunk:
-            continue
-        result = await safe_send_media_group(bot, chat_id, chunk, thread)
-        if result == "stale":
-            topic_name = REV_CACHE.get((bot.id, chat_id, thread)) if thread else None
-            new_thread = None
-            if topic_name:
-                log.warning(f"Stale thread {thread} in dm {chat_id} — recreating '{topic_name}'")
-                invalidate_thread(bot.id, chat_id, topic_name)
-                new_thread = await topic_thread(bot, state, topic_name, chat_id)
-            if new_thread:
-                thread = new_thread  # remaining chunks continue on the fresh topic
-                result = await safe_send_media_group(bot, chat_id, chunk, thread, retry=False)
-        ok = (result is True) and ok
-        sent = True
-        await asyncio.sleep(config.QUEUE_COOLDOWN)
-    return ok if sent else False
-
-async def send_input_grouped(bot, chat_id, thread, m_list, custom, line, lead=None):
-    """Style-B album send from InputMedia objects (one caption per 10-chunk).
-    Self-heals stale threads ONCE and continues remaining chunks on the fresh thread."""
-    state = get_state(bot.id)
-    v = [m for m in m_list if not isinstance(m, InputMediaDocument)]
-    d = [m for m in m_list if isinstance(m, InputMediaDocument)]
-    chunks = [v[i:i + 10] for i in range(0, len(v), 10)] + \
-             [d[i:i + 10] for i in range(0, len(d), 10)]
-    ok = True
-    for chunk in chunks:
-        if not chunk:
-            continue
-        base_cap, base_ents = album_first_caption(chunk)
-        chunk = [first_input(m, custom, line, base_cap, base_ents, lead) if i == 0
-                 else type(m)(media=m.media)
-                 for i, m in enumerate(chunk)]
-        result = await safe_send_media_group(bot, chat_id, chunk, thread)
-        if result == "stale":
-            topic_name = REV_CACHE.get((bot.id, chat_id, thread)) if thread else None
-            new_thread = None
-            if topic_name:
-                log.warning(f"Stale thread {thread} in dm {chat_id} — recreating '{topic_name}'")
-                invalidate_thread(bot.id, chat_id, topic_name)
-                new_thread = await topic_thread(bot, state, topic_name, chat_id)
-            if new_thread:
-                thread = new_thread
-                result = await safe_send_media_group(bot, chat_id, chunk, thread, retry=False)
-        ok = (result is True) and ok
-        await asyncio.sleep(config.QUEUE_COOLDOWN)
-    return ok
-
-# ================= ALL-MESSAGES TOPIC PICKER (per sender) =================
-async def show_chooser(context, state, sender_id):
-    """After batch delay, ask (buttons) which topic the All-Messages media goes to.
-    One chooser PER SENDER — so two admins posting to General at the same time
-    never get their media mixed into the same prompt."""
+# ================= ALL-MESSAGES TOPIC PICKER =================
+async def show_chooser(context, state):
+    """After batch delay, ask (buttons) which topic the All-Messages media goes to."""
     try:
         await asyncio.sleep(config.ALBUM_BATCH_DELAY)
-        ch = state["choosers"].get(sender_id)
+        ch = state.get("chooser")
         if not ch or not ch["m"] or ch["msg"]:
             return
-        names = sorted({n for (b, c, n) in TOPIC_CACHE if b == context.bot.id})
-        ch["map"] = names
-        kb = [[InlineKeyboardButton(n, callback_data=f"pick:{sender_id}:{i}")]
+        names = sorted({n for (b, n) in TOPIC_CACHE if b == context.bot.id})
+        ch["map"] = [(TOPIC_CACHE[(context.bot.id, n)], n) for n in names]
+        kb = [[InlineKeyboardButton(n, callback_data=f"pick:{i}")]
               for i, n in enumerate(names)]
-        kb.append([InlineKeyboardButton("🏠 Stay here", callback_data=f"pick:{sender_id}:-1")])
+        kb.append([InlineKeyboardButton("🏠 Stay here", callback_data="pick:-1")])
         m = await context.bot.send_message(
-            ch["sender"], f"📥 {len(ch['m'])} media — choose topic:",
+            config.ADMIN_ID, f"📥 {len(ch['m'])} media — choose topic:",
             reply_markup=InlineKeyboardMarkup(kb))
         ch["msg"] = m.message_id
-        ch["task"] = asyncio.create_task(chooser_timeout(context, state, sender_id))
+        ch["task"] = asyncio.create_task(chooser_timeout(context, state))
     except asyncio.CancelledError:
         pass
     except TelegramError as e:
         log.error(f"chooser show failed: {e}")
 
-async def chooser_timeout(context, state, sender_id):
+async def chooser_timeout(context, state):
     try:
         await asyncio.sleep(60.0)
-        ch = state["choosers"].get(sender_id)
+        ch = state.get("chooser")
         if ch and ch["m"]:
             if ch["msg"]:
                 try:
-                    await context.bot.delete_message(ch.get("sender"), ch["msg"])
+                    await context.bot.delete_message(config.ADMIN_ID, ch["msg"])
                 except TelegramError:
                     pass
-            state["choosers"].pop(sender_id, None)
+            state["chooser"] = None
             m = await context.bot.send_message(
-                ch.get("sender"), "⌛ No topic chosen — left as is.")
+                config.ADMIN_ID, "⌛ No topic chosen — left as is.")
             asyncio.create_task(delete_msg(m, 5))
     except asyncio.CancelledError:
         pass
 
 async def pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    if not q or q.from_user.id not in config.ADMIN_IDS:
+    if not q or q.from_user.id != config.ADMIN_ID:
         return  # silent for strangers
     try:
         await q.answer()
     except TelegramError:
         pass
     state = get_state(context.bot.id)
-    try:
-        _, sender_id_s, idx_s = q.data.split(":")
-        sender_id = int(sender_id_s)
-        idx = int(idx_s)
-    except (ValueError, IndexError):
-        return
-    ch = state["choosers"].get(sender_id)
+    ch = state.get("chooser")
     if not ch or not ch["m"]:
-        state["choosers"].pop(sender_id, None)
+        state["chooser"] = None
         try:
             await q.message.delete()
         except TelegramError:
             pass
         return
-    name = ch["map"][idx] if idx >= 0 else None
-    sender = ch.get("sender") or sender_id
+    try:
+        idx = int(q.data.split(":")[1])
+    except (ValueError, IndexError):
+        return
+    thread, name = ch["map"][idx] if idx >= 0 else (None, None)
     msgs, ids = ch["m"][:], ch["ids"][:]
     if ch["msg"]:
         try:
-            await context.bot.delete_message(sender, ch["msg"])
+            await context.bot.delete_message(config.ADMIN_ID, ch["msg"])
         except TelegramError:
             pass
-    state["choosers"].pop(sender_id, None)
-    if not name:
-        return  # 🏠 Stay here — leave media as is
+    state["chooser"] = None
 
     line = tag_line(name)
     custom = state["settings"]["custom_caption"]
-    sender_thread = await topic_thread(context.bot, state, name, sender)
-    await send_msgs_grouped(context.bot, sender, sender_thread, msgs, custom, line)
-    alias = await alias_for(sender_id, context.bot)
-    for c in partner_chats(sender):
-        t = await topic_thread(context.bot, state, name, c)
-        if t is None:
-            continue
-        if not await send_msgs_grouped(context.bot, c, t, msgs, custom, line,
-                                       lead=mirror_lead(alias)):
-            await mirror_warn_once(context.bot, state, sender)
+    base_cap, base_ents = album_first_caption(msgs)
+    final = []
+    for i, m in enumerate(msgs):
+        obj = first_obj(m, custom, line, base_cap, base_ents) if i == 0 \
+            else get_media_obj(m, None)
+        if obj:
+            final.append(obj)
+    v = [m for m in final if not isinstance(m, InputMediaDocument)]
+    d = [m for m in final if isinstance(m, InputMediaDocument)]
+    for chunk in [v[i:i+10] for i in range(0, len(v), 10)] + \
+                 [d[i:i+10] for i in range(0, len(d), 10)]:
+        if chunk:
+            await safe_send_media_group(context.bot, config.ADMIN_ID, chunk, thread or None)
+            await asyncio.sleep(config.QUEUE_COOLDOWN)
     if state["settings"]["autodelete"]:
-        await safe_delete_messages(context.bot, sender, ids)
+        await safe_delete_messages(context.bot, config.ADMIN_ID, ids)
 
 # ================= SAFE HELPERS =================
 async def delete_msg(msg, delay=0):
@@ -746,23 +475,14 @@ def get_media_obj(msg, cap=None, cap_entities=None, parse_mode=None):
     if msg.document: return InputMediaDocument(msg.document.file_id, **kwargs)
     return None
 
-async def safe_send_media_group(bot, chat_id, media, thread=None, retry=True):
-    """Returns True (ok), False (permanent fail) or "stale" (topic thread no longer exists)."""
+async def safe_send_media_group(bot, chat_id, media, thread=None):
     kwargs = {"chat_id": chat_id, "media": media}
     if thread:
         kwargs["message_thread_id"] = thread
     try:
         await bot.send_media_group(**kwargs)
         return True
-    except BadRequest as e:
-        if "thread" in str(e).lower():
-            log.warning(f"Stale thread detected in send_media_group: {e}")
-            return "stale"
-        log.error(f"send_media_group BadRequest: {e}")
-        return False
     except RetryAfter as e:
-        if not retry:
-            return False
         log.warning(f"FloodWait on send_media_group — waiting {e.retry_after}s")
         await asyncio.sleep(e.retry_after + 1.5)
         try:
@@ -802,18 +522,15 @@ HELP_OVERVIEW = (
 
 HELP_CATS = {
     "relay": (
-        "📡 *RELAY & MIRROR*\n"
-        "/relay – ON: clean copy → your topic + partner DM • OFF: in-place\n"
-        "/bind <t> – external chat → topic (both DMs)\n"
+        "📡 *RELAY & TOPICS*\n"
+        "/relay – ON: media → DM topics • OFF: old mode\n"
+        "/bind <t> – this chat → topic (saved)\n"
         "/unbind – remove this chat's bind\n"
-        "/use <t> – sticky topic for TEXT in General + unbound source chats (alone = clear)\n"
+        "/use <t> – temporary topic (alone = clear)\n"
         "/topics – list topics & binds\n"
         "/tdel <t> – archive topic, media stays\n"
         "/trename <old> <new> – rename topic (registry + title)\n"
-        "💡 Media: cleaned in your topic + mirrored to partner (anonymous alias)\n"
-        "💡 Text: mirrored to partner (topic→topic, General→General)\n"
-        "💡 All Messages media: buttons ALWAYS pick the topic (no silent auto-route)\n"
-        "💡 /start auto-syncs & repairs topics in your DM"
+        "💡 All Messages: buttons pick the topic"
     ),
     "migrate": (
         "🔄 *MIGRATION*\n"
@@ -823,7 +540,7 @@ HELP_CATS = {
     ),
     "behavior": (
         "⚙️ *BEHAVIOR*\n"
-        "/gp – grouping on/off (also groups single forwards sent close together)\n"
+        "/gp – grouping on/off\n"
         "/autodelete – delete original after relay\n"
         "/addcaption <txt> – custom caption\n"
         "/removecaption – back to originals\n"
@@ -849,7 +566,6 @@ def help_kb():
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     asyncio.create_task(delete_msg(update.message))
-    await auto_sync_topics(context.bot, update.message.from_user.id)
     m = await update.message.reply_text("🚀 **Vault Active**.", parse_mode="Markdown")
     asyncio.create_task(delete_msg(m, 5))
 
@@ -861,7 +577,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    if not q or q.from_user.id not in config.ADMIN_IDS:
+    if not q or q.from_user.id != config.ADMIN_ID:
         return
     try:
         await q.answer()
@@ -884,7 +600,7 @@ async def relay_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     asyncio.create_task(delete_msg(update.message))
     state["settings"]["relay"] = not state["settings"]["relay"]
     status = "ON" if state["settings"]["relay"] else "OFF (in-place mode)"
-    m = await update.message.reply_text(f"Relay & mirror to DM topics: **{status}**", parse_mode='Markdown')
+    m = await update.message.reply_text(f"Relay to DM topics: **{status}**", parse_mode='Markdown')
     asyncio.create_task(delete_msg(m, 5))
 
 async def bind_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -897,11 +613,7 @@ async def bind_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🔗 Bound here: `{cur}`" if cur else "🔗 This chat is not bound. Use /bind <topic>")
         asyncio.create_task(delete_msg(m, 8))
         return
-    dest = update.message.chat_id if update.message.chat_id in config.ADMIN_IDS \
-        else config.ADMIN_IDS[0]
-    thread = await topic_thread(context.bot, state, name, dest)
-    for c in partner_chats(dest):
-        await topic_thread(context.bot, state, name, c)
+    thread = await topic_thread(context.bot, state, name)
     if thread is None:
         m = await update.message.reply_text(
             "⚠️ **Chat is not a forum yet.** Fix (2 steps):\n"
@@ -934,44 +646,27 @@ async def use_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = get_state(context.bot.id)
     asyncio.create_task(delete_msg(update.message))
     name = update.message.text.replace("/use", "", 1).strip()
-    uid = update.message.from_user.id
     if not name:
-        state["manual_topic"].pop(uid, None)
-        m = await update.message.reply_text("🧭 Sticky topic cleared.")
+        state["manual_topic"] = None
+        m = await update.message.reply_text("🧭 Manual topic cleared.")
         asyncio.create_task(delete_msg(m, 5))
         return
-    sender = update.message.chat_id if update.message.chat_id in config.ADMIN_IDS \
-        else config.ADMIN_IDS[0]
-    ok_chats, bad_chats = [], []
-    for c in [sender] + partner_chats(sender):
-        if await topic_thread(context.bot, state, name, c):
-            ok_chats.append(c)
-        else:
-            bad_chats.append(c)
-    if not ok_chats:
+    thread = await topic_thread(context.bot, state, name)
+    if thread is None:
         m = await update.message.reply_text(
-            "⚠️ No DM is forum-ready yet — each user must /start the bot, enable "
-            "Threaded Mode in BotFather (Threads Settings) and the Topics toggle in their DM.")
+            "⚠️ Chat is not a forum yet — enable Threaded Mode in BotFather "
+            "(Bot Settings → Threads Settings) and the Topics toggle in this DM.")
         asyncio.create_task(delete_msg(m, 12))
         return
-    state["manual_topic"][uid] = name
-    txt = (f"🧭 Topic **{name}** ready in {len(ok_chats)}/{len(config.ADMIN_IDS)} DMs.\n"
-           f"Your General TEXT messages (and unbound source chats) now route to it.\n"
-           f"Media in All Messages still always asks via buttons. /use alone = clear.")
-    if bad_chats:
-        txt += ("\n⚠️ Partner DM not ready — they must /start the bot + enable Topics; "
-                "the topic will be created there automatically on first mirror.")
-    m = await update.message.reply_text(txt, parse_mode='Markdown')
-    asyncio.create_task(delete_msg(m, 8))
+    state["manual_topic"] = name
+    m = await update.message.reply_text(f"🧭 Manual topic: **{name}**", parse_mode='Markdown')
+    asyncio.create_task(delete_msg(m, 5))
 
 async def topics_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     asyncio.create_task(delete_msg(update.message))
     await ensure_cache()
-    tnames = sorted({n for (b, c, n) in TOPIC_CACHE if b == context.bot.id})
-    tlines = []
-    for n in tnames:
-        cnt = sum(1 for (b, c, nn) in TOPIC_CACHE if b == context.bot.id and nn == n)
-        tlines.append(f"• {n} — in {cnt}/{len(config.ADMIN_IDS)} DMs")
+    tlines = [f"• {n} — thread `{t}`" for (b, n), t in sorted(TOPIC_CACHE.items())
+              if b == context.bot.id]
     blines = [f"• chat `{c}` → {n}" for (b, c), n in sorted(BIND_CACHE.items())
               if b == context.bot.id]
     text = "📚 **Topics**:\n" + ("\n".join(tlines) if tlines else "(none yet)")
@@ -989,38 +684,34 @@ async def trename_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     old, new = parts[0], " ".join(parts[1:])
     await ensure_cache()
-    rows = [(c, t) for (b, c, n), t in TOPIC_CACHE.items()
-            if b == context.bot.id and n == old]
-    if not rows:
+    th = TOPIC_CACHE.get((context.bot.id, old))
+    if th is None:
         m = await update.message.reply_text(f"❌ Topic '{old}' not found.")
         asyncio.create_task(delete_msg(m, 8))
         return
-    if any(n == new for (b, c, n) in TOPIC_CACHE if b == context.bot.id):
+    if (context.bot.id, new) in TOPIC_CACHE:
         m = await update.message.reply_text(f"❌ A topic named '{new}' already exists.")
         asyncio.create_task(delete_msg(m, 8))
         return
-    for c, th in rows:
-        try:
-            await context.bot.edit_forum_topic(chat_id=c, message_thread_id=th, name=new)
-        except TelegramError as e:
-            log.warning(f"edit_forum_topic failed (registry still renamed): {e}")
+    try:
+        await context.bot.edit_forum_topic(
+            chat_id=config.ADMIN_ID, message_thread_id=th, name=new)
+    except TelegramError as e:
+        log.warning(f"edit_forum_topic failed (registry still renamed): {e}")
     await _db_conn.execute(
         "UPDATE topics SET name=? WHERE bot_id=? AND name=?", (new, context.bot.id, old))
     await _db_conn.execute(
         "UPDATE bindings SET topic_name=? WHERE bot_id=? AND topic_name=?",
         (new, context.bot.id, old))
     await _db_conn.commit()
-    for c, th in rows:
-        TOPIC_CACHE.pop((context.bot.id, c, old), None)
-        TOPIC_CACHE[(context.bot.id, c, new)] = th
-        REV_CACHE.pop((context.bot.id, c, th), None)
-        REV_CACHE[(context.bot.id, c, th)] = new
+    TOPIC_CACHE.pop((context.bot.id, old), None)
+    TOPIC_CACHE[(context.bot.id, new)] = th
+    REV_CACHE[(context.bot.id, th)] = new
     for k in [k for k, v in BIND_CACHE.items() if k[0] == context.bot.id and v == old]:
         BIND_CACHE[k] = new
     st = get_state(context.bot.id)
-    for u, v in list(st["manual_topic"].items()):
-        if v == old:
-            st["manual_topic"][u] = new
+    if st["manual_topic"] == old:
+        st["manual_topic"] = new
     m = await update.message.reply_text(f"✅ Renamed: **{old}** → **{new}**", parse_mode='Markdown')
     asyncio.create_task(delete_msg(m, 5))
 
@@ -1034,22 +725,17 @@ async def tdel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         asyncio.create_task(delete_msg(m, 8))
         return
     await ensure_cache()
-    rows = [(c, t) for (b, c, n), t in TOPIC_CACHE.items()
-            if b == context.bot.id and n == name]
+    th = TOPIC_CACHE.get((context.bot.id, name))
     await _db_conn.execute(
         "DELETE FROM topics WHERE bot_id=? AND name=?", (context.bot.id, name))
     await _db_conn.execute(
         "DELETE FROM bindings WHERE bot_id=? AND topic_name=?", (context.bot.id, name))
     await _db_conn.commit()
-    for c, t in rows:
-        TOPIC_CACHE.pop((context.bot.id, c, name), None)
-        REV_CACHE.pop((context.bot.id, c, t), None)
+    TOPIC_CACHE.pop((context.bot.id, name), None)
+    if th is not None:
+        REV_CACHE.pop((context.bot.id, th), None)
     for k in [k for k, v in BIND_CACHE.items() if k[0] == context.bot.id and v == name]:
         BIND_CACHE.pop(k, None)
-    st = get_state(context.bot.id)
-    for u, v in list(st["manual_topic"].items()):
-        if v == name:
-            st["manual_topic"].pop(u, None)
     m = await update.message.reply_text(
         f"📦 **{name}** archived — bot forgot it.\n"
         "The Telegram topic and all its media remain untouched.", parse_mode='Markdown')
@@ -1198,6 +884,7 @@ async def dbfind_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         asyncio.create_task(delete_msg(m, 20))
         return
     if reply is not None:
+        # replied to a non-media message: no dead-end — just arm like "alone"
         arm_inspect("find", update.message.chat_id, context)
         m = await update.message.reply_text(
             "📥 **Find mode ON** — forward the media now (60s).\n"
@@ -1232,6 +919,7 @@ async def dbdel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         asyncio.create_task(delete_msg(m, 10))
         return
     if reply is not None:
+        # replied to a non-media message: no dead-end — just arm like "alone"
         arm_inspect("del", update.message.chat_id, context)
         m = await update.message.reply_text(
             "🗑 **Delete mode ON** — forward the media now (60s).\n"
@@ -1359,7 +1047,7 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"- Delete: `{state['settings']['autodelete']}`\n"
             f"- DB check: `{state['db_enabled']}`\n"
             f"- Caption: `{state['settings']['custom_caption']}`\n"
-            f"- Sticky topic: `{state['manual_topic'].get(update.message.from_user.id) or '—'}`\n"
+            f"- Manual topic: `{state['manual_topic']}`\n"
             f"- Bound here: `{bound}`\n"
             f"- Code: `{CODE_VERSION}`")
     m = await update.message.reply_text(text, parse_mode='Markdown')
@@ -1382,25 +1070,31 @@ async def flush_queue_delayed(context: ContextTypes.DEFAULT_TYPE, qkey):
         q.message_ids.clear()
         q.timer_task = None
 
+        v = [m for m in m_list if not isinstance(m, InputMediaDocument)]
+        d = [m for m in m_list if isinstance(m, InputMediaDocument)]
+        chunks = [v[i:i+10] for i in range(0, len(v), 10)] + \
+                 [d[i:i+10] for i in range(0, len(d), 10)]
+
         line = tag_line(q.topic_name)
         custom = state["settings"]["custom_caption"]
         log.info(f"flush: topic={q.topic_name!r} line={line!r} items={len(m_list)} "
                  f"first_orig_cap={repr(m_list[0].caption) if m_list else None}")
-        # ONE caption per sent group: first item only, rest clean
-        ok = await send_input_grouped(context.bot, dest_chat, thread, m_list, custom, line)
+        ok = True
+        for chunk in chunks:
+            if not chunk:
+                continue
+            # ONE caption per sent group: first item only, rest clean
+            base_cap, base_ents = album_first_caption(chunk)
+            chunk = [first_input(m, custom, line, base_cap, base_ents) if i == 0
+                     else type(m)(media=m.media)
+                     for i, m in enumerate(chunk)]
+            ok = await safe_send_media_group(context.bot, dest_chat, chunk, thread)
+            await asyncio.sleep(config.QUEUE_COOLDOWN)
 
-        if not ok and dest_chat in config.ADMIN_IDS:
+        if not ok and dest_chat == config.ADMIN_ID:
             await dm_warn_once(context.bot, state, c_id)
 
-        # MIRROR: tagged copies to partner DMs
-        if q.mirror:
-            alias = await alias_for(q.sender_id or c_id, context.bot)
-            for m_chat, m_thread in q.mirror:
-                if not await send_input_grouped(context.bot, m_chat, m_thread, m_list,
-                                                custom, line, lead=mirror_lead(alias)):
-                    await mirror_warn_once(context.bot, state, c_id)
-
-        if ok and state["settings"]["autodelete"]:
+        if state["settings"]["autodelete"]:
             await safe_delete_messages(context.bot, c_id, ids)
 
         for pm_id in q.processing_msg_ids:
@@ -1410,8 +1104,7 @@ async def flush_queue_delayed(context: ContextTypes.DEFAULT_TYPE, qkey):
                 pass
         q.processing_msg_ids.clear()
 
-def enqueue(state, bot, chat_id, dest_chat, thread, obj, message_id, topic_name=None,
-            mirror=None, sender_id=None):
+def enqueue(state, bot, chat_id, dest_chat, thread, obj, message_id, topic_name=None):
     qkey = (chat_id, thread)
     q = state["queues"].get(qkey)
     if q is None:
@@ -1420,8 +1113,6 @@ def enqueue(state, bot, chat_id, dest_chat, thread, obj, message_id, topic_name=
     q.dest_chat = dest_chat
     q.thread = thread
     q.topic_name = topic_name
-    q.mirror = mirror or []
-    q.sender_id = sender_id
     q.media.append(obj)
     q.message_ids.append(message_id)
     if q.timer_task:
@@ -1431,7 +1122,7 @@ def enqueue(state, bot, chat_id, dest_chat, thread, obj, message_id, topic_name=
             try:
                 p = await bot.send_message(
                     chat_id, "⏳ Grouping media...",
-                    message_thread_id=thread if chat_id in config.ADMIN_IDS else None)
+                    message_thread_id=thread if chat_id == config.ADMIN_ID else None)
                 q.processing_msg_ids.append(p.message_id)
             except TelegramError:
                 pass
@@ -1460,22 +1151,25 @@ async def route_gp_album_delayed(mg_id, context):
         thread = data['thread']
 
         # BIG ALBUM (6+): send as-is to destination
+        # ONE caption per group: first item carries title + Topic line, rest clean
         if len(msgs) >= GP_ALBUM_SKIP_MIN:
             line = tag_line(data.get("topic_name"))
             custom = state["settings"]["custom_caption"]
+            base_cap, base_ents = album_first_caption(msgs)
+            final = []
+            for i, m in enumerate(msgs):
+                obj = first_obj(m, custom, line, base_cap, base_ents) if i == 0 \
+                    else get_media_obj(m, None)
+                if obj:
+                    final.append(obj)
             log.info(f"send big-album: topic={data.get('topic_name')!r} line={line!r} "
-                     f"n={len(msgs)}")
-            ok = await send_msgs_grouped(context.bot, dest_chat, thread, msgs, custom, line)
-            if not ok and dest_chat in config.ADMIN_IDS:
-                await dm_warn_once(context.bot, state, chat_id)
-            if data.get("mirror"):
-                alias = await alias_for(data.get("sender_id") or chat_id, context.bot)
-                for m_chat, m_thread in data["mirror"]:
-                    if not await send_msgs_grouped(context.bot, m_chat, m_thread, msgs,
-                                                   custom, line, lead=mirror_lead(alias)):
-                        await mirror_warn_once(context.bot, state, chat_id)
-            if ok and state["settings"]["autodelete"]:
-                await safe_delete_messages(context.bot, chat_id, ids)
+                     f"n={len(final)} first_cap={repr(final[0].caption) if final else None}")
+            if final:
+                ok = await safe_send_media_group(context.bot, dest_chat, final, thread)
+                if not ok and dest_chat == config.ADMIN_ID:
+                    await dm_warn_once(context.bot, state, chat_id)
+                if state["settings"]["autodelete"]:
+                    await safe_delete_messages(context.bot, chat_id, ids)
             return
 
         # SMALL ALBUM (1-5): feed into the group queue
@@ -1483,8 +1177,7 @@ async def route_gp_album_delayed(mg_id, context):
             obj = get_media_obj(m, m.caption, m.caption_entities)
             if obj:
                 enqueue(state, context.bot, chat_id, dest_chat, thread, obj,
-                        m.message_id, topic_name=data.get("topic_name"),
-                        mirror=data.get("mirror"), sender_id=data.get("sender_id"))
+                        m.message_id, topic_name=data.get("topic_name"))
     except asyncio.CancelledError:
         pass
     except Exception as e:
@@ -1504,115 +1197,23 @@ async def send_off_mode_album_delayed(mg_id, context):
         thread = data['thread']
         line = tag_line(data.get("topic_name"))
         custom = state["settings"]["custom_caption"]
-        ok = await send_msgs_grouped(context.bot, dest_chat, thread, msgs, custom, line)
-        if not ok and dest_chat in config.ADMIN_IDS:
-            await dm_warn_once(context.bot, state, chat_id)
-        if data.get("mirror"):
-            alias = await alias_for(data.get("sender_id") or chat_id, context.bot)
-            for m_chat, m_thread in data["mirror"]:
-                if not await send_msgs_grouped(context.bot, m_chat, m_thread, msgs,
-                                               custom, line, lead=mirror_lead(alias)):
-                    await mirror_warn_once(context.bot, state, chat_id)
-        if ok and state["settings"]["autodelete"]:
-            await safe_delete_messages(context.bot, chat_id, ids)
+        base_cap, base_ents = album_first_caption(msgs)
+        final = []
+        for i, m in enumerate(msgs):
+            obj = first_obj(m, custom, line, base_cap, base_ents) if i == 0 \
+                else get_media_obj(m, None)
+            if obj:
+                final.append(obj)
+        if final:
+            ok = await safe_send_media_group(context.bot, dest_chat, final, thread)
+            if not ok and dest_chat == config.ADMIN_ID:
+                await dm_warn_once(context.bot, state, chat_id)
+            if state["settings"]["autodelete"]:
+                await safe_delete_messages(context.bot, chat_id, ids)
     except asyncio.CancelledError:
         pass
     except Exception as e:
         log.error(f"off_mode_album error: {e}")
-
-# ================= TEXT MIRROR =================
-async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Text typed by an admin → mirrored to the partner with the sender's alias.
-    Inside a topic  → partner's matching topic (self-heals stale threads after resets).
-    Unknown topic   → partner's General (never silently dropped).
-    In General      → partner's General."""
-    msg = update.message
-    if not msg or not msg.text:
-        return
-    state = get_state(context.bot.id)
-    if not state["settings"]["relay"]:
-        return
-    chat_id = msg.chat_id
-    src_thread = msg.message_thread_id
-    if chat_id not in config.ADMIN_IDS:
-        return
-    partners = partner_chats(chat_id)
-    if not partners:
-        return
-    await ensure_cache()
-    log.info(f"text mirror intake: dm={chat_id} thread={src_thread} "
-             f"from={msg.from_user.id} len={len(msg.text)}")
-
-    # Which topic was it typed in (if any)?
-    topic_name = None
-    if src_thread:
-        topic_name = REV_CACHE.get((context.bot.id, chat_id, src_thread))
-        if not topic_name:
-            row = await db_fetchone(
-                "SELECT name FROM topics WHERE bot_id=? AND chat_id=? AND thread_id=?",
-                (context.bot.id, chat_id, src_thread))
-            if row:
-                topic_name = row[0]
-                REV_CACHE[(context.bot.id, chat_id, src_thread)] = topic_name
-    if not topic_name:
-        manual = state["manual_topic"].get(msg.from_user.id)
-        if manual:
-            topic_name = manual
-            log.info(f"text mirror: no usable thread (src={src_thread}) in dm {chat_id} "
-                     f"— routed via sticky topic {topic_name!r}")
-        else:
-            log.info(f"text mirror: no usable thread (src={src_thread}) in dm {chat_id} "
-                     f"— falling back to partner's General")
-
-    alias = await alias_for(msg.from_user.id, context.bot)
-    prefix = mirror_lead(alias)
-    body = msg.text if len(msg.text) <= 4000 else msg.text[:4000]
-    text = f"{prefix}\n{body}"
-    ents = []
-    if len(body) == len(msg.text) and msg.entities:
-        shift = len(prefix) + 1
-        ents = [MessageEntity(type=e.type, offset=e.offset + shift, length=e.length)
-                for e in msg.entities
-                if e.offset + shift + e.length <= len(text)]
-
-    async def _deliver(c):
-        kw = {}
-        if ents:
-            kw["entities"] = ents
-        t = await topic_thread(context.bot, state, topic_name, c) if topic_name else None
-        if topic_name and not t:
-            log.warning(f"text mirror: partner dm {c} not forum-ready for {topic_name!r}")
-            return False
-        if t:
-            kw["message_thread_id"] = t
-        try:
-            await context.bot.send_message(c, text, **kw)
-            return True
-        except BadRequest as e:
-            if t:
-                log.warning(f"text mirror: stale thread {t} in dm {c} ({e}) — recreating")
-                invalidate_thread(context.bot.id, c, topic_name)
-                t2 = await topic_thread(context.bot, state, topic_name, c)
-                if t2:
-                    try:
-                        kw["message_thread_id"] = t2
-                        await context.bot.send_message(c, text, **kw)
-                        return True
-                    except TelegramError as e2:
-                        log.error(f"text mirror retry to {c} failed: {e2}")
-            return False
-        except TelegramError as e:
-            log.error(f"text mirror to {c} failed: {e}")
-            return False
-
-    delivered = False
-    for c in partners:
-        if await _deliver(c):
-            delivered = True
-    if not delivered:
-        await mirror_warn_once(context.bot, state, chat_id)
-    else:
-        log.info(f"text mirror delivered: dm={chat_id} topic={topic_name!r}")
 
 # ================= CENTRAL MESSAGE INTAKE =================
 async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1663,47 +1264,29 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     relay = state["settings"]["relay"]
     src_thread = msg.message_thread_id
     chooser_mode = False
-    mirror = []                                            # [(partner_chat, thread)]
-    sender_id = msg.from_user.id if msg.from_user else chat_id
     if relay:
         await ensure_cache()
-        if chat_id in config.ADMIN_IDS and src_thread:
-            # Inside a vault topic: clean copy back into THE SAME topic plus a
-            # tagged mirror copy into the partner's matching topic.
+        if chat_id == config.ADMIN_ID and src_thread:
+            # Inside a vault topic: clean-copy back into THE SAME topic,
+            # then delete the original. (Bot's own copy never re-triggers.)
             thread = src_thread
-            dest_chat = chat_id
-            topic_name = REV_CACHE.get((context.bot.id, chat_id, src_thread))
+            topic_name = REV_CACHE.get((context.bot.id, src_thread))
             if not topic_name:
                 row = await db_fetchone(
-                    "SELECT name FROM topics WHERE bot_id=? AND chat_id=? AND thread_id=?",
-                    (context.bot.id, chat_id, src_thread))
+                    "SELECT name FROM topics WHERE bot_id=? AND thread_id=?",
+                    (context.bot.id, src_thread))
                 if row:
                     topic_name = row[0]
-                    REV_CACHE[(context.bot.id, chat_id, src_thread)] = topic_name
-            if topic_name:
-                for c in partner_chats(chat_id):
-                    t = await topic_thread(context.bot, state, topic_name, c)
-                    if t:
-                        mirror.append((c, t))
-        elif chat_id in config.ADMIN_IDS:
-            # All Messages (General): ALWAYS ask via buttons which topic this goes
-            # to — no silent auto-routing from a leftover /use, so nothing quietly
-            # "disappears" into a topic you didn't explicitly pick this time.
-            chooser_mode = any(b == context.bot.id for (b, c, n) in TOPIC_CACHE)
-            topic_name, thread, dest_chat = None, None, chat_id
+                    REV_CACHE[(context.bot.id, src_thread)] = topic_name
+        elif chat_id == config.ADMIN_ID:
+            # All Messages: topic picker buttons decide (if topics exist)
+            chooser_mode = any(b == context.bot.id for (b, n) in TOPIC_CACHE)
+            topic_name, thread = None, None
         else:
             # Source chats (groups etc.): binding wins, then /use
-            topic_name = binding_for(context.bot.id, chat_id) or \
-                state["manual_topic"].get(sender_id) or \
-                next(reversed(state["manual_topic"].values()), None)
-            dest_chat = config.ADMIN_IDS[0]
-            thread = await topic_thread(context.bot, state, topic_name, dest_chat) \
-                if topic_name else None
-            if topic_name:
-                for c in partner_chats(dest_chat):
-                    t = await topic_thread(context.bot, state, topic_name, c)
-                    if t:
-                        mirror.append((c, t))
+            topic_name = binding_for(context.bot.id, chat_id) or state["manual_topic"]
+            thread = await topic_thread(context.bot, state, topic_name) if topic_name else None
+        dest_chat = config.ADMIN_ID
     else:
         thread, topic_name, dest_chat = None, None, chat_id
 
@@ -1722,7 +1305,7 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "UPDATE media_vault SET duplicate_count = duplicate_count + 1, "
                 "last_duplicate_at = ? WHERE file_hash = ?", (time.time(), f_hash))
             if old_row:
-                await old_delete(f_hash)
+                await old_delete(f_hash)  # keep old db consistent
             await _db_conn.commit()
             if state["db_enabled"]:
                 current_time = time.time()
@@ -1738,7 +1321,10 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if state["settings"]["autodelete"]:
                     await delete_msg(msg)
                 return
+            # /db OFF: duplicate was counted above, but blocking is disabled —
+            # fall through so the media is relayed normally.
         elif old_row:
+            # MIGRATION: carry old created_at + bot_name, then drain old row
             await _db_conn.execute(
                 "UPDATE media_vault SET bot_name = ?, created_at = ? WHERE file_hash = ?",
                 (old_row[0] or bot_label(context.bot), old_row[1] or time.time(), f_hash))
@@ -1750,35 +1336,60 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.error(f"DB error during duplicate check: {e}")
 
-    # --- ALL MESSAGES PICKER: hold media, ask which topic via buttons (per sender) ---
+    # --- ALL MESSAGES PICKER: hold media, ask which topic via buttons ---
     if chooser_mode:
-        chs = state["choosers"]
-        ch = chs.get(sender_id)
+        ch = state["chooser"]
         if ch is None:
-            ch = chs[sender_id] = {"m": [], "ids": [], "task": None, "msg": None,
-                                    "map": [], "sender": chat_id, "sender_id": sender_id}
+            state["chooser"] = {"m": [], "ids": [], "task": None, "msg": None, "map": []}
+            ch = state["chooser"]
         ch["m"].append(msg)
         ch["ids"].append(msg.message_id)
         if ch["task"]:
             ch["task"].cancel()
-        ch["task"] = asyncio.create_task(show_chooser(context, state, sender_id))
+        ch["task"] = asyncio.create_task(show_chooser(context, state))
         return
 
-    # --- SINGLE MEDIA (no Telegram media_group_id) ---
-    if not msg.media_group_id:
-        if state["settings"]["auto_group"]:
-            # GP ON: feed into the SAME batching queue as real albums, so consecutive
-            # single forwards (gallery/document picks that Telegram doesn't group)
-            # merge together exactly like a real album would. Fixes "1+1+1+1" and
-            # "4+2+1" staying ungrouped/split.
-            obj = get_media_obj(msg, msg.caption, msg.caption_entities)
-            if obj:
-                enqueue(state, context.bot, chat_id, dest_chat, thread, obj,
-                        msg.message_id, topic_name=topic_name, mirror=mirror,
-                        sender_id=sender_id)
+    # --- GROUPING MODE ---
+    if state["settings"]["auto_group"]:
+        if msg.media_group_id:
+            mg_id = msg.media_group_id
+            if mg_id not in state["gp_albums"]:
+                state["gp_albums"][mg_id] = {'m': [], 'ids': [], 'task': None,
+                                             'chat_id': chat_id,
+                                             'dest_chat': dest_chat,
+                                             'thread': thread,
+                                             'topic_name': topic_name}
+            d = state["gp_albums"][mg_id]
+            d['m'].append(msg)
+            d['ids'].append(msg.message_id)
+            if d['task']:
+                d['task'].cancel()
+            d['task'] = asyncio.create_task(route_gp_album_delayed(mg_id, context))
             return
+        obj = get_media_obj(msg, msg.caption, msg.caption_entities)
+        if not obj:
+            return
+        enqueue(state, context.bot, chat_id, dest_chat, thread, obj, msg.message_id,
+                topic_name=topic_name)
+        return
 
-        # GP OFF: instant relay fast path (unchanged)
+    # --- GP OFF: ALBUM PASSTHROUGH ---
+    if msg.media_group_id:
+        mg_id = msg.media_group_id
+        if mg_id not in state["off_mode_albums"]:
+            state["off_mode_albums"][mg_id] = {'m': [], 'ids': [], 'task': None,
+                                               'chat_id': chat_id,
+                                               'dest_chat': dest_chat,
+                                               'thread': thread,
+                                               'topic_name': topic_name}
+        d = state["off_mode_albums"][mg_id]
+        d['m'].append(msg)
+        d['ids'].append(msg.message_id)
+        if d['task']:
+            d['task'].cancel()
+        d['task'] = asyncio.create_task(send_off_mode_album_delayed(mg_id, context))
+    else:
+        # SINGLE MEDIA: copy to destination (strips forward tag)
         try:
             kwargs = {"chat_id": dest_chat, "from_chat_id": chat_id, "message_id": msg.message_id}
             if thread:
@@ -1795,72 +1406,24 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 elif ent:
                     kwargs["caption_entities"] = ent
             await context.bot.copy_message(**kwargs)
+            if state["settings"]["autodelete"]:
+                await delete_msg(msg)
             await asyncio.sleep(0.1)
         except RetryAfter as e:
             log.warning(f"FloodWait on copy_message — waiting {e.retry_after}s")
             await asyncio.sleep(e.retry_after + 1.5)
             try:
                 await context.bot.copy_message(**kwargs)
+                if state["settings"]["autodelete"]:
+                    await delete_msg(msg)
             except TelegramError as e2:
                 log.error(f"copy_message failed after retry: {e2}")
-                if dest_chat in config.ADMIN_IDS:
+                if dest_chat == config.ADMIN_ID:
                     await dm_warn_once(context.bot, state, chat_id)
         except TelegramError as e:
             log.error(f"copy_message failed: {e}")
-            if dest_chat in config.ADMIN_IDS:
+            if dest_chat == config.ADMIN_ID:
                 await dm_warn_once(context.bot, state, chat_id)
-
-        if mirror:
-            alias = await alias_for(sender_id, context.bot)
-            tag = tag_line(topic_name)
-            custom = state["settings"]["custom_caption"]
-
-            async def _one_mirror(m_chat, m_thread):
-                if not await send_msgs_grouped(context.bot, m_chat, m_thread, [msg],
-                                               custom, tag, lead=mirror_lead(alias)):
-                    await mirror_warn_once(context.bot, state, chat_id)
-
-            await asyncio.gather(*[_one_mirror(c, t) for c, t in mirror])
-
-        if state["settings"]["autodelete"]:
-            await delete_msg(msg)
-        return
-
-    # --- ALBUMS (multi-item, real Telegram media_group_id): batch, then send ---
-    if state["settings"]["auto_group"]:
-        mg_id = msg.media_group_id
-        if mg_id not in state["gp_albums"]:
-            state["gp_albums"][mg_id] = {'m': [], 'ids': [], 'task': None,
-                                         'chat_id': chat_id,
-                                         'dest_chat': dest_chat,
-                                         'thread': thread,
-                                         'topic_name': topic_name,
-                                         'mirror': mirror,
-                                         'sender_id': sender_id}
-        d = state["gp_albums"][mg_id]
-        d['m'].append(msg)
-        d['ids'].append(msg.message_id)
-        if d['task']:
-            d['task'].cancel()
-        d['task'] = asyncio.create_task(route_gp_album_delayed(mg_id, context))
-        return
-
-    # --- GP OFF: ALBUM PASSTHROUGH ---
-    mg_id = msg.media_group_id
-    if mg_id not in state["off_mode_albums"]:
-        state["off_mode_albums"][mg_id] = {'m': [], 'ids': [], 'task': None,
-                                           'chat_id': chat_id,
-                                           'dest_chat': dest_chat,
-                                           'thread': thread,
-                                           'topic_name': topic_name,
-                                           'mirror': mirror,
-                                           'sender_id': sender_id}
-    d = state["off_mode_albums"][mg_id]
-    d['m'].append(msg)
-    d['ids'].append(msg.message_id)
-    if d['task']:
-        d['task'].cancel()
-    d['task'] = asyncio.create_task(send_off_mode_album_delayed(mg_id, context))
 
 # ================= STARTUP / SHUTDOWN =================
 async def start_single_bot(app):
@@ -1924,8 +1487,6 @@ async def run_multiple_bots():
         app.add_handler(CommandHandler("removecaption", removecaption_command, filters=admin_filter))
         app.add_handler(CommandHandler("settings", settings_command, filters=admin_filter))
         app.add_handler(MessageHandler(admin_filter & ~filters.COMMAND, process_message))
-        app.add_handler(MessageHandler(admin_filter & filters.TEXT & ~filters.COMMAND,
-                                       process_text), group=1)
         app.add_handler(CallbackQueryHandler(pick_callback, pattern="^pick:"))
         app.add_handler(CallbackQueryHandler(help_callback, pattern="^help:"))
         apps.append(app)
